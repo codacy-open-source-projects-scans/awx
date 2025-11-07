@@ -30,6 +30,7 @@ EXPECTED_VALUES = {
     'awx_license_instance_free': 0,
     'awx_pending_jobs_total': 0,
     'awx_database_connections_total': 1,
+    'awx_license_expiry': 0,
 }
 
 
@@ -48,7 +49,7 @@ def test_metrics_counts(organization_factory, job_template_factory, workflow_job
     for gauge in gauges:
         for sample in gauge.samples:
             # name, label, value, timestamp, exemplar
-            name, _, value, _, _ = sample
+            name, _, value, _, _, _ = sample
             assert EXPECTED_VALUES[name] == value
 
 

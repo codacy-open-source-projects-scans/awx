@@ -55,8 +55,7 @@ from wsgiref.util import FileWrapper
 
 # django-ansible-base
 from ansible_base.lib.utils.requests import get_remote_hosts
-from ansible_base.rbac.models import RoleEvaluation, ObjectRole
-from ansible_base.resource_registry.shared_types import OrganizationType, TeamType, UserType
+from ansible_base.rbac.models import RoleEvaluation
 
 # AWX
 from awx.main.tasks.system import send_notifications, update_inventory_computed_fields
@@ -85,7 +84,6 @@ from awx.api.generics import (
 from awx.api.views.labels import LabelSubListCreateAttachDetachView
 from awx.api.versioning import reverse
 from awx.main import models
-from awx.main.models.rbac import get_role_definition
 from awx.main.utils import (
     camelcase_to_underscore,
     extract_ansible_vars,
@@ -671,81 +669,16 @@ class ScheduleUnifiedJobsList(SubListAPIView):
     name = _('Schedule Jobs List')
 
 
-def immutablesharedfields(cls):
-    '''
-    Class decorator to prevent modifying shared resources when ALLOW_LOCAL_RESOURCE_MANAGEMENT setting is set to False.
-
-    Works by overriding these view methods:
-    - create
-    - delete
-    - perform_update
-    create and delete are overridden to raise a PermissionDenied exception.
-    perform_update is overridden to check if any shared fields are being modified,
-    and raise a PermissionDenied exception if so.
-    '''
-    # create instead of perform_create because some of our views
-    # override create instead of perform_create
-    if hasattr(cls, 'create'):
-        cls.original_create = cls.create
-
-        @functools.wraps(cls.create)
-        def create_wrapper(*args, **kwargs):
-            if settings.ALLOW_LOCAL_RESOURCE_MANAGEMENT:
-                return cls.original_create(*args, **kwargs)
-            raise PermissionDenied({'detail': _('Creation of this resource is not allowed. Create this resource via the platform ingress.')})
-
-        cls.create = create_wrapper
-
-    if hasattr(cls, 'delete'):
-        cls.original_delete = cls.delete
-
-        @functools.wraps(cls.delete)
-        def delete_wrapper(*args, **kwargs):
-            if settings.ALLOW_LOCAL_RESOURCE_MANAGEMENT:
-                return cls.original_delete(*args, **kwargs)
-            raise PermissionDenied({'detail': _('Deletion of this resource is not allowed. Delete this resource via the platform ingress.')})
-
-        cls.delete = delete_wrapper
-
-    if hasattr(cls, 'perform_update'):
-        cls.original_perform_update = cls.perform_update
-
-        @functools.wraps(cls.perform_update)
-        def update_wrapper(*args, **kwargs):
-            if not settings.ALLOW_LOCAL_RESOURCE_MANAGEMENT:
-                view, serializer = args
-                instance = view.get_object()
-                if instance:
-                    if isinstance(instance, models.Organization):
-                        shared_fields = OrganizationType._declared_fields.keys()
-                    elif isinstance(instance, models.User):
-                        shared_fields = UserType._declared_fields.keys()
-                    elif isinstance(instance, models.Team):
-                        shared_fields = TeamType._declared_fields.keys()
-                    attrs = serializer.validated_data
-                    for field in shared_fields:
-                        if field in attrs and getattr(instance, field) != attrs[field]:
-                            raise PermissionDenied({field: _(f"Cannot change shared field '{field}'. Alter this field via the platform ingress.")})
-            return cls.original_perform_update(*args, **kwargs)
-
-        cls.perform_update = update_wrapper
-
-    return cls
-
-
-@immutablesharedfields
 class TeamList(ListCreateAPIView):
     model = models.Team
     serializer_class = serializers.TeamSerializer
 
 
-@immutablesharedfields
 class TeamDetail(RetrieveUpdateDestroyAPIView):
     model = models.Team
     serializer_class = serializers.TeamSerializer
 
 
-@immutablesharedfields
 class TeamUsersList(BaseUsersList):
     model = models.User
     serializer_class = serializers.UserSerializer
@@ -787,9 +720,19 @@ class TeamRolesList(SubListAttachDetachAPIView):
         team = get_object_or_404(models.Team, pk=self.kwargs['pk'])
         credential_content_type = ContentType.objects.get_for_model(models.Credential)
         if role.content_type == credential_content_type:
-            if not role.content_object.organization or role.content_object.organization.id != team.organization.id:
-                data = dict(msg=_("You cannot grant credential access to a team when the Organization field isn't set, or belongs to a different organization"))
+            if not role.content_object.organization:
+                data = dict(
+                    msg=_("You cannot grant access to a credential that is not assigned to an organization (private credentials cannot be assigned to teams)")
+                )
                 return Response(data, status=status.HTTP_400_BAD_REQUEST)
+            elif role.content_object.organization.id != team.organization.id:
+                if not request.user.is_superuser:
+                    data = dict(
+                        msg=_(
+                            "You cannot grant a team access to a credential in a different organization. Only superusers can grant cross-organization credential access to teams"
+                        )
+                    )
+                    return Response(data, status=status.HTTP_400_BAD_REQUEST)
 
         return super(TeamRolesList, self).post(request, *args, **kwargs)
 
@@ -816,17 +759,9 @@ class TeamProjectsList(SubListAPIView):
     def get_queryset(self):
         team = self.get_parent_object()
         self.check_parent_access(team)
-        model_ct = ContentType.objects.get_for_model(self.model)
-        parent_ct = ContentType.objects.get_for_model(self.parent_model)
-
-        rd = get_role_definition(team.member_role)
-        role = ObjectRole.objects.filter(object_id=team.id, content_type=parent_ct, role_definition=rd).first()
-        if role is None:
-            # Team has no permissions, therefore team has no projects
-            return self.model.objects.none()
-        else:
-            project_qs = self.model.accessible_objects(self.request.user, 'read_role')
-            return project_qs.filter(id__in=RoleEvaluation.objects.filter(content_type_id=model_ct.id, role=role).values_list('object_id'))
+        my_qs = self.model.accessible_objects(self.request.user, 'read_role')
+        team_qs = models.Project.accessible_objects(team, 'read_role')
+        return my_qs & team_qs
 
 
 class TeamActivityStreamList(SubListAPIView):
@@ -941,13 +876,23 @@ class ProjectTeamsList(ListAPIView):
     serializer_class = serializers.TeamSerializer
 
     def get_queryset(self):
-        p = get_object_or_404(models.Project, pk=self.kwargs['pk'])
-        if not self.request.user.can_access(models.Project, 'read', p):
+        parent = get_object_or_404(models.Project, pk=self.kwargs['pk'])
+        if not self.request.user.can_access(models.Project, 'read', parent):
             raise PermissionDenied()
-        project_ct = ContentType.objects.get_for_model(models.Project)
+
+        project_ct = ContentType.objects.get_for_model(parent)
         team_ct = ContentType.objects.get_for_model(self.model)
-        all_roles = models.Role.objects.filter(Q(descendents__content_type=project_ct) & Q(descendents__object_id=p.pk), content_type=team_ct)
-        return self.model.accessible_objects(self.request.user, 'read_role').filter(pk__in=[t.content_object.pk for t in all_roles])
+
+        roles_on_project = models.Role.objects.filter(
+            content_type=project_ct,
+            object_id=parent.pk,
+        )
+
+        team_member_parent_roles = models.Role.objects.filter(children__in=roles_on_project, role_field='member_role', content_type=team_ct).distinct()
+
+        team_ids = team_member_parent_roles.values_list('object_id', flat=True)
+        my_qs = self.model.accessible_objects(self.request.user, 'read_role').filter(pk__in=team_ids)
+        return my_qs
 
 
 class ProjectSchedulesList(SubListCreateAPIView):
@@ -1127,7 +1072,6 @@ class ProjectCopy(CopyAPIView):
     copy_return_serializer_class = serializers.ProjectSerializer
 
 
-@immutablesharedfields
 class UserList(ListCreateAPIView):
     model = models.User
     serializer_class = serializers.UserSerializer
@@ -1184,14 +1128,6 @@ class UserRolesList(SubListAttachDetachAPIView):
         role = get_object_or_400(models.Role, pk=sub_id)
 
         content_types = ContentType.objects.get_for_models(models.Organization, models.Team, models.Credential)  # dict of {model: content_type}
-        # Prevent user to be associated with team/org when ALLOW_LOCAL_RESOURCE_MANAGEMENT is False
-        if not settings.ALLOW_LOCAL_RESOURCE_MANAGEMENT:
-            for model in [models.Organization, models.Team]:
-                ct = content_types[model]
-                if role.content_type == ct and role.role_field in ['member_role', 'admin_role']:
-                    data = dict(msg=_(f"Cannot directly modify user membership to {ct.model}. Direct shared resource management disabled"))
-                    return Response(data, status=status.HTTP_403_FORBIDDEN)
-
         credential_content_type = content_types[models.Credential]
         if role.content_type == credential_content_type:
             if 'disassociate' not in request.data and role.content_object.organization and user not in role.content_object.organization.member_role:
@@ -1226,7 +1162,6 @@ class UserOrganizationsList(OrganizationCountsMixin, SubListAPIView):
     model = models.Organization
     serializer_class = serializers.OrganizationSerializer
     parent_model = models.User
-    relationship = 'organizations'
 
     def get_queryset(self):
         parent = self.get_parent_object()
@@ -1240,7 +1175,6 @@ class UserAdminOfOrganizationsList(OrganizationCountsMixin, SubListAPIView):
     model = models.Organization
     serializer_class = serializers.OrganizationSerializer
     parent_model = models.User
-    relationship = 'admin_of_organizations'
 
     def get_queryset(self):
         parent = self.get_parent_object()
@@ -1264,7 +1198,6 @@ class UserActivityStreamList(SubListAPIView):
         return qs.filter(Q(actor=parent) | Q(user__in=[parent]))
 
 
-@immutablesharedfields
 class UserDetail(RetrieveUpdateDestroyAPIView):
     model = models.User
     serializer_class = serializers.UserSerializer
@@ -3435,6 +3368,7 @@ class JobRelaunch(RetrieveAPIView):
 
         copy_kwargs = {}
         retry_hosts = serializer.validated_data.get('hosts', None)
+        job_type = serializer.validated_data.get('job_type', None)
         if retry_hosts and retry_hosts != 'all':
             if obj.status in ACTIVE_STATES:
                 return Response(
@@ -3455,6 +3389,8 @@ class JobRelaunch(RetrieveAPIView):
                 )
             copy_kwargs['limit'] = ','.join(retry_host_list)
 
+        if job_type:
+            copy_kwargs['job_type'] = job_type
         new_job = obj.copy_unified_job(**copy_kwargs)
         result = new_job.signal_start(**serializer.validated_data['credential_passwords'])
         if not result:
@@ -4236,13 +4172,6 @@ class RoleUsersList(SubListAttachDetachAPIView):
         role = self.get_parent_object()
 
         content_types = ContentType.objects.get_for_models(models.Organization, models.Team, models.Credential)  # dict of {model: content_type}
-        if not settings.ALLOW_LOCAL_RESOURCE_MANAGEMENT:
-            for model in [models.Organization, models.Team]:
-                ct = content_types[model]
-                if role.content_type == ct and role.role_field in ['member_role', 'admin_role']:
-                    data = dict(msg=_(f"Cannot directly modify user membership to {ct.model}. Direct shared resource management disabled"))
-                    return Response(data, status=status.HTTP_403_FORBIDDEN)
-
         credential_content_type = content_types[models.Credential]
         if role.content_type == credential_content_type:
             if 'disassociate' not in request.data and role.content_object.organization and user not in role.content_object.organization.member_role:
@@ -4284,9 +4213,21 @@ class RoleTeamsList(SubListAttachDetachAPIView):
 
         credential_content_type = ContentType.objects.get_for_model(models.Credential)
         if role.content_type == credential_content_type:
-            if not role.content_object.organization or role.content_object.organization.id != team.organization.id:
-                data = dict(msg=_("You cannot grant credential access to a team when the Organization field isn't set, or belongs to a different organization"))
+            # Private credentials (no organization) are never allowed for teams
+            if not role.content_object.organization:
+                data = dict(
+                    msg=_("You cannot grant access to a credential that is not assigned to an organization (private credentials cannot be assigned to teams)")
+                )
                 return Response(data, status=status.HTTP_400_BAD_REQUEST)
+            # Cross-organization credentials are only allowed for superusers
+            elif role.content_object.organization.id != team.organization.id:
+                if not request.user.is_superuser:
+                    data = dict(
+                        msg=_(
+                            "You cannot grant a team access to a credential in a different organization. Only superusers can grant cross-organization credential access to teams"
+                        )
+                    )
+                    return Response(data, status=status.HTTP_400_BAD_REQUEST)
 
         action = 'attach'
         if request.data.get('disassociate', None):
@@ -4304,34 +4245,6 @@ class RoleTeamsList(SubListAttachDetachAPIView):
             team.member_role.children.add(role)
 
         return Response(status=status.HTTP_204_NO_CONTENT)
-
-
-class RoleParentsList(SubListAPIView):
-    deprecated = True
-    model = models.Role
-    serializer_class = serializers.RoleSerializer
-    parent_model = models.Role
-    relationship = 'parents'
-    permission_classes = (IsAuthenticated,)
-    search_fields = ('role_field', 'content_type__model')
-
-    def get_queryset(self):
-        role = models.Role.objects.get(pk=self.kwargs['pk'])
-        return models.Role.filter_visible_roles(self.request.user, role.parents.all())
-
-
-class RoleChildrenList(SubListAPIView):
-    deprecated = True
-    model = models.Role
-    serializer_class = serializers.RoleSerializer
-    parent_model = models.Role
-    relationship = 'children'
-    permission_classes = (IsAuthenticated,)
-    search_fields = ('role_field', 'content_type__model')
-
-    def get_queryset(self):
-        role = models.Role.objects.get(pk=self.kwargs['pk'])
-        return models.Role.filter_visible_roles(self.request.user, role.children.all())
 
 
 # Create view functions for all of the class-based views to simplify inclusion

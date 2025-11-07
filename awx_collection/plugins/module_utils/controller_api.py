@@ -15,7 +15,6 @@ from ansible.module_utils.six.moves.configparser import ConfigParser, NoOptionEr
 from base64 import b64encode
 from socket import getaddrinfo, IPPROTO_TCP
 import time
-import re
 from json import loads, dumps
 from os.path import isfile, expanduser, split, join, exists, isdir
 from os import access, R_OK, getcwd, environ, getenv
@@ -50,15 +49,43 @@ class ItemNotDefined(Exception):
 class ControllerModule(AnsibleModule):
     url = None
     AUTH_ARGSPEC = dict(
-        controller_host=dict(required=False, aliases=['tower_host'], fallback=(env_fallback, ['CONTROLLER_HOST', 'TOWER_HOST'])),
-        controller_username=dict(required=False, aliases=['tower_username'], fallback=(env_fallback, ['CONTROLLER_USERNAME', 'TOWER_USERNAME'])),
-        controller_password=dict(no_log=True, aliases=['tower_password'], required=False, fallback=(env_fallback, ['CONTROLLER_PASSWORD', 'TOWER_PASSWORD'])),
-        validate_certs=dict(type='bool', aliases=['tower_verify_ssl'], required=False, fallback=(env_fallback, ['CONTROLLER_VERIFY_SSL', 'TOWER_VERIFY_SSL'])),
-        request_timeout=dict(type='float', required=False, fallback=(env_fallback, ['CONTROLLER_REQUEST_TIMEOUT'])),
-        controller_config_file=dict(type='path', aliases=['tower_config_file'], required=False, default=None),
+        controller_host=dict(
+            required=False,
+            aliases=['tower_host', 'aap_hostname'],
+            fallback=(env_fallback, ['CONTROLLER_HOST', 'TOWER_HOST', 'AAP_HOSTNAME'])),
+        controller_username=dict(
+            required=False,
+            aliases=['tower_username', 'aap_username'],
+            fallback=(env_fallback, ['CONTROLLER_USERNAME', 'TOWER_USERNAME', 'AAP_USERNAME'])),
+        controller_password=dict(
+            no_log=True,
+            aliases=['tower_password', 'aap_password'],
+            required=False,
+            fallback=(env_fallback, ['CONTROLLER_PASSWORD', 'TOWER_PASSWORD', 'AAP_PASSWORD'])),
+        validate_certs=dict(
+            type='bool',
+            aliases=['tower_verify_ssl', 'aap_validate_certs'],
+            required=False,
+            fallback=(env_fallback, ['CONTROLLER_VERIFY_SSL', 'TOWER_VERIFY_SSL', 'AAP_VALIDATE_CERTS'])),
+        request_timeout=dict(
+            type='float',
+            aliases=['aap_request_timeout'],
+            required=False,
+            fallback=(env_fallback, ['CONTROLLER_REQUEST_TIMEOUT', 'AAP_REQUEST_TIMEOUT'])),
+        aap_token=dict(
+            type='raw',
+            no_log=True,
+            required=False,
+            fallback=(env_fallback, ['CONTROLLER_OAUTH_TOKEN', 'TOWER_OAUTH_TOKEN', 'AAP_TOKEN'])
+        ),
+        controller_config_file=dict(
+            type='path',
+            aliases=['tower_config_file'],
+            required=False,
+            default=None),
     )
     # Associations of these types are ordered and have special consideration in the modified associations function
-    ordered_associations = ['instance_groups', 'galaxy_credentials']
+    ordered_associations = ['instance_groups', 'galaxy_credentials', 'input_inventories']
     short_params = {
         'host': 'controller_host',
         'username': 'controller_username',
@@ -106,7 +133,7 @@ class ControllerModule(AnsibleModule):
                 setattr(self, short_param, direct_value)
 
         # Perform some basic validation
-        if not re.match('^https{0,1}://', self.host):
+        if not self.host.startswith(("https://", "http://")):  # NOSONAR
             self.host = "https://{0}".format(self.host)
 
         # Try to parse the hostname as a url
@@ -511,7 +538,18 @@ class ControllerAPIModule(ControllerModule):
                 self.fail_json(msg='Invalid authentication credentials for {0} (HTTP 401).'.format(url.path))
             # Sanity check: Did we get a forbidden response, which means that the user isn't allowed to do this? Report that.
             elif he.code == 403:
-                self.fail_json(msg="You don't have permission to {1} to {0} (HTTP 403).".format(url.path, method))
+                # Hack: Tell the customer to use the platform supported collection when interacting with Org, Team, User Controller endpoints
+                err_msg = he.fp.read().decode('utf-8')
+                try:
+                    # Defensive coding. Handle json responses and non-json responses
+                    err_msg = loads(err_msg)
+                    err_msg = err_msg['detail']
+                # JSONDecodeError only available on Python 3.5+
+                except ValueError:
+                    pass
+                prepend_msg = " Use the collection ansible.platform to modify resources Organization, User, or Team." if (
+                    "this resource via the platform ingress") in err_msg else ""
+                self.fail_json(msg="You don't have permission to {1} to {0} (HTTP 403).{2}".format(url.path, method, prepend_msg))
             # Sanity check: Did we get a 404 response?
             # Requests with primary keys will return a 404 if there is no response, and we want to consistently trap these.
             elif he.code == 404:

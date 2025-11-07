@@ -639,7 +639,9 @@ class UserAccess(BaseAccess):
     prefetch_related = ('resource',)
 
     def filtered_queryset(self):
-        if settings.ORG_ADMINS_CAN_SEE_ALL_USERS and (self.user.admin_of_organizations.exists() or self.user.auditor_of_organizations.exists()):
+        if settings.ORG_ADMINS_CAN_SEE_ALL_USERS and (
+            Organization.access_qs(self.user, 'change').exists() or Organization.access_qs(self.user, 'audit').exists()
+        ):
             qs = User.objects.all()
         else:
             qs = (
@@ -1224,7 +1226,9 @@ class TeamAccess(BaseAccess):
     )
 
     def filtered_queryset(self):
-        if settings.ORG_ADMINS_CAN_SEE_ALL_USERS and (self.user.admin_of_organizations.exists() or self.user.auditor_of_organizations.exists()):
+        if settings.ORG_ADMINS_CAN_SEE_ALL_USERS and (
+            Organization.access_qs(self.user, 'change').exists() or Organization.access_qs(self.user, 'audit').exists()
+        ):
             return self.model.objects.all()
         return self.model.objects.filter(
             Q(organization__in=Organization.accessible_pk_qs(self.user, 'member_role')) | Q(pk__in=self.model.accessible_pk_qs(self.user, 'read_role'))
@@ -2098,7 +2102,7 @@ class WorkflowJobAccess(BaseAccess):
     def filtered_queryset(self):
         return WorkflowJob.objects.filter(
             Q(unified_job_template__in=UnifiedJobTemplate.accessible_pk_qs(self.user, 'read_role'))
-            | Q(organization__in=Organization.objects.filter(Q(admin_role__members=self.user)), is_bulk_job=True)
+            | Q(organization__in=Organization.accessible_pk_qs(self.user, 'auditor_role'))
         )
 
     def can_read(self, obj):
@@ -2496,12 +2500,11 @@ class UnifiedJobAccess(BaseAccess):
 
     def filtered_queryset(self):
         inv_pk_qs = Inventory._accessible_pk_qs(Inventory, self.user, 'read_role')
-        org_auditor_qs = Organization.objects.filter(Q(admin_role__members=self.user) | Q(auditor_role__members=self.user))
         qs = self.model.objects.filter(
             Q(unified_job_template_id__in=UnifiedJobTemplate.accessible_pk_qs(self.user, 'read_role'))
             | Q(inventoryupdate__inventory_source__inventory__id__in=inv_pk_qs)
             | Q(adhoccommand__inventory__id__in=inv_pk_qs)
-            | Q(organization__in=org_auditor_qs)
+            | Q(organization__in=Organization.accessible_pk_qs(self.user, 'auditor_role'))
         )
         return qs
 
@@ -2565,7 +2568,7 @@ class NotificationTemplateAccess(BaseAccess):
         if settings.ANSIBLE_BASE_ROLE_SYSTEM_ACTIVATED:
             return self.model.access_qs(self.user, 'view')
         return self.model.objects.filter(
-            Q(organization__in=Organization.access_qs(self.user, 'add_notificationtemplate')) | Q(organization__in=self.user.auditor_of_organizations)
+            Q(organization__in=Organization.access_qs(self.user, 'add_notificationtemplate')) | Q(organization__in=Organization.access_qs(self.user, 'audit'))
         ).distinct()
 
     @check_superuser
@@ -2600,7 +2603,7 @@ class NotificationAccess(BaseAccess):
     def filtered_queryset(self):
         return self.model.objects.filter(
             Q(notification_template__organization__in=Organization.access_qs(self.user, 'add_notificationtemplate'))
-            | Q(notification_template__organization__in=self.user.auditor_of_organizations)
+            | Q(notification_template__organization__in=Organization.access_qs(self.user, 'audit'))
         ).distinct()
 
     def can_delete(self, obj):

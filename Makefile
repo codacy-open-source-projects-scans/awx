@@ -8,6 +8,7 @@ NODE ?= node
 NPM_BIN ?= npm
 KIND_BIN ?= $(shell which kind)
 CHROMIUM_BIN=/tmp/chrome-linux/chrome
+GIT_REPO_NAME ?= $(shell basename `git rev-parse --show-toplevel`)
 GIT_BRANCH ?= $(shell git rev-parse --abbrev-ref HEAD)
 MANAGEMENT_COMMAND ?= awx-manage
 VERSION ?= $(shell $(PYTHON) tools/scripts/scm_version.py 2> /dev/null)
@@ -18,8 +19,16 @@ COLLECTION_VERSION ?= $(shell $(PYTHON) tools/scripts/scm_version.py | cut -d . 
 COLLECTION_SANITY_ARGS ?= --docker
 # collection unit testing directories
 COLLECTION_TEST_DIRS ?= awx_collection/test/awx
+# pytest added args to collect coverage
+COVERAGE_ARGS ?= --cov --cov-report=xml --junitxml=reports/junit.xml
+# pytest test directories
+TEST_DIRS ?= awx/main/tests/unit awx/main/tests/functional awx/conf/tests
+# pytest args to run tests in parallel
+PARALLEL_TESTS ?= -n auto
 # collection integration test directories (defaults to all)
 COLLECTION_TEST_TARGET ?=
+# Python version for ansible-test (must be 3.11, 3.12, or 3.13)
+ANSIBLE_TEST_PYTHON_VERSION ?= 3.13
 # args for collection install
 COLLECTION_PACKAGE ?= awx
 COLLECTION_NAMESPACE ?= awx
@@ -56,9 +65,9 @@ DEV_DOCKER_OWNER ?= ansible
 # Docker will only accept lowercase, so github names like Paul need to be paul
 DEV_DOCKER_OWNER_LOWER = $(shell echo $(DEV_DOCKER_OWNER) | tr A-Z a-z)
 DEV_DOCKER_TAG_BASE ?= ghcr.io/$(DEV_DOCKER_OWNER_LOWER)
-DEVEL_IMAGE_NAME ?= $(DEV_DOCKER_TAG_BASE)/awx_devel:$(COMPOSE_TAG)
-IMAGE_KUBE_DEV=$(DEV_DOCKER_TAG_BASE)/awx_kube_devel:$(COMPOSE_TAG)
-IMAGE_KUBE=$(DEV_DOCKER_TAG_BASE)/awx:$(COMPOSE_TAG)
+DEVEL_IMAGE_NAME ?= $(DEV_DOCKER_TAG_BASE)/$(GIT_REPO_NAME)_devel:$(COMPOSE_TAG)
+IMAGE_KUBE_DEV=$(DEV_DOCKER_TAG_BASE)/$(GIT_REPO_NAME)_kube_devel:$(COMPOSE_TAG)
+IMAGE_KUBE=$(DEV_DOCKER_TAG_BASE)/$(GIT_REPO_NAME):$(COMPOSE_TAG)
 
 # Common command to use for running ansible-playbook
 ANSIBLE_PLAYBOOK ?= ansible-playbook -e ansible_python_interpreter=$(PYTHON)
@@ -70,7 +79,7 @@ RECEPTOR_IMAGE ?= quay.io/ansible/receptor:devel
 SRC_ONLY_PKGS ?= cffi,pycparser,psycopg,twilio
 # These should be upgraded in the AWX and Ansible venv before attempting
 # to install the actual requirements
-VENV_BOOTSTRAP ?= pip==21.2.4 setuptools==69.0.2 setuptools_scm[toml]==8.0.4 wheel==0.42.0 cython==0.29.37
+VENV_BOOTSTRAP ?= pip==21.2.4 setuptools==80.9.0 setuptools_scm[toml]==8.0.4 wheel==0.42.0 cython==3.1.3
 
 NAME ?= awx
 
@@ -308,14 +317,14 @@ black: reports
 	@chmod +x .git/hooks/pre-commit
 
 genschema: reports
-	$(MAKE) swagger PYTEST_ARGS="--genschema --create-db "
+	$(MAKE) swagger PYTEST_ADDOPTS="--genschema --create-db "
 	mv swagger.json schema.json
 
 swagger: reports
 	@if [ "$(VENV_BASE)" ]; then \
 		. $(VENV_BASE)/awx/bin/activate; \
 	fi; \
-	(set -o pipefail && py.test --cov --cov-report=xml --junitxml=reports/junit.xml $(PYTEST_ARGS) awx/conf/tests/functional awx/main/tests/functional/api awx/main/tests/docs | tee reports/$@.report)
+	(set -o pipefail && py.test $(COVERAGE_ARGS) $(PARALLEL_TESTS) awx/conf/tests/functional awx/main/tests/functional/api awx/main/tests/docs | tee reports/$@.report)
 	@if [ "${GITHUB_ACTIONS}" = "true" ]; \
 	then \
 	  echo 'cov-report-files=reports/coverage.xml' >> "${GITHUB_OUTPUT}"; \
@@ -333,14 +342,12 @@ api-lint:
 awx-link:
 	[ -d "/awx_devel/awx.egg-info" ] || $(PYTHON) /awx_devel/tools/scripts/egg_info_dev
 
-TEST_DIRS ?= awx/main/tests/unit awx/main/tests/functional awx/conf/tests
-PYTEST_ARGS ?= -n auto
 ## Run all API unit tests.
 test:
 	if [ "$(VENV_BASE)" ]; then \
 		. $(VENV_BASE)/awx/bin/activate; \
 	fi; \
-	PYTHONDONTWRITEBYTECODE=1 py.test -p no:cacheprovider $(PYTEST_ARGS) $(TEST_DIRS)
+	PYTHONDONTWRITEBYTECODE=1 py.test -p no:cacheprovider $(PARALLEL_TESTS) $(TEST_DIRS)
 	cd awxkit && $(VENV_BASE)/awx/bin/tox -re py3
 	awx-manage check_migrations --dry-run --check  -n 'missing_migration_file'
 
@@ -349,7 +356,7 @@ live_test:
 
 ## Run all API unit tests with coverage enabled.
 test_coverage:
-	$(MAKE) test PYTEST_ARGS="--create-db --cov --cov-report=xml --junitxml=reports/junit.xml"
+	$(MAKE) test PYTEST_ADDOPTS="--create-db $(COVERAGE_ARGS)"
 	@if [ "${GITHUB_ACTIONS}" = "true" ]; \
 	then \
 	  echo 'cov-report-files=awxkit/coverage.xml,reports/coverage.xml' >> "${GITHUB_OUTPUT}"; \
@@ -357,7 +364,7 @@ test_coverage:
 	fi
 
 test_migrations:
-	PYTHONDONTWRITEBYTECODE=1 py.test -p no:cacheprovider --migrations -m migration_test --create-db --cov=awx --cov-report=xml --junitxml=reports/junit.xml $(PYTEST_ARGS) $(TEST_DIRS)
+	PYTHONDONTWRITEBYTECODE=1 py.test -p no:cacheprovider --migrations -m migration_test --create-db $(PARALLEL_TESTS) $(COVERAGE_ARGS) $(TEST_DIRS)
 	@if [ "${GITHUB_ACTIONS}" = "true" ]; \
 	then \
 	  echo 'cov-report-files=reports/coverage.xml' >> "${GITHUB_OUTPUT}"; \
@@ -375,7 +382,7 @@ test_collection:
 	fi && \
 	if ! [ -x "$(shell command -v ansible-playbook)" ]; then pip install ansible-core; fi
 	ansible --version
-	py.test $(COLLECTION_TEST_DIRS) --cov --cov-report=xml --junitxml=reports/junit.xml -v
+	py.test $(COLLECTION_TEST_DIRS) $(COVERAGE_ARGS) -v
 	@if [ "${GITHUB_ACTIONS}" = "true" ]; \
 	then \
 	  echo 'cov-report-files=reports/coverage.xml' >> "${GITHUB_OUTPUT}"; \
@@ -426,8 +433,8 @@ test_collection_sanity:
 
 test_collection_integration: install_collection
 	cd $(COLLECTION_INSTALL) && \
-		ansible-test integration --coverage -vvv $(COLLECTION_TEST_TARGET) && \
-		ansible-test coverage xml --requirements --group-by command --group-by version
+		PATH="$$($(PYTHON) -c 'import sys; import os; print(os.path.dirname(sys.executable))'):$$PATH" ansible-test integration --python $(ANSIBLE_TEST_PYTHON_VERSION) --coverage -vvv $(COLLECTION_TEST_TARGET) && \
+		PATH="$$($(PYTHON) -c 'import sys; import os; print(os.path.dirname(sys.executable))'):$$PATH" ansible-test coverage xml --requirements --group-by command --group-by version
 	@if [ "${GITHUB_ACTIONS}" = "true" ]; \
 	then \
 	  echo cov-report-files="$$(find "$(COLLECTION_INSTALL)/tests/output/reports/" -type f -name 'coverage=integration*.xml' -print0 | tr '\0' ',' | sed 's#,$$##')" >> "${GITHUB_OUTPUT}"; \
@@ -491,7 +498,7 @@ docker-compose-sources: .git/hooks/pre-commit
 	fi;
 
 	$(ANSIBLE_PLAYBOOK) -i tools/docker-compose/inventory tools/docker-compose/ansible/sources.yml \
-	    -e awx_image=$(DEV_DOCKER_TAG_BASE)/awx_devel \
+	    -e awx_image=$(DEV_DOCKER_TAG_BASE)/$(GIT_REPO_NAME)_devel \
 	    -e awx_image_tag=$(COMPOSE_TAG) \
 	    -e receptor_image=$(RECEPTOR_IMAGE) \
 	    -e control_plane_node_count=$(CONTROL_PLANE_NODE_COUNT) \
@@ -561,6 +568,7 @@ Dockerfile.dev: tools/ansible/roles/dockerfile/templates/Dockerfile.j2
 ## Build awx_devel image for docker compose development environment
 docker-compose-build: Dockerfile.dev
 	DOCKER_BUILDKIT=1 docker build \
+		--ssh default=$(SSH_AUTH_SOCK) \
 		-f Dockerfile.dev \
 		-t $(DEVEL_IMAGE_NAME) \
 		--build-arg BUILDKIT_INLINE_CACHE=1 \
@@ -572,6 +580,7 @@ docker-compose-buildx: Dockerfile.dev
 	- docker buildx create --name docker-compose-buildx
 	docker buildx use docker-compose-buildx
 	- docker buildx build \
+		--ssh default=$(SSH_AUTH_SOCK) \
 		--push \
 		--build-arg BUILDKIT_INLINE_CACHE=1 \
 		$(DOCKER_DEVEL_CACHE_FLAG) \
@@ -589,23 +598,8 @@ docker-clean-volumes: docker-compose-clean docker-compose-container-group-clean
 
 docker-refresh: docker-clean docker-compose
 
-## Docker Development Environment with Elastic Stack Connected
-docker-compose-elk: awx/projects docker-compose-sources
-	$(DOCKER_COMPOSE) -f tools/docker-compose/_sources/docker-compose.yml -f tools/elastic/docker-compose.logstash-link.yml -f tools/elastic/docker-compose.elastic-override.yml up --no-recreate
-
-docker-compose-cluster-elk: awx/projects docker-compose-sources
-	$(DOCKER_COMPOSE) -f tools/docker-compose/_sources/docker-compose.yml -f tools/elastic/docker-compose.logstash-link-cluster.yml -f tools/elastic/docker-compose.elastic-override.yml up --no-recreate
-
 docker-compose-container-group:
 	MINIKUBE_CONTAINER_GROUP=true $(MAKE) docker-compose
-
-clean-elk:
-	docker stop tools_kibana_1
-	docker stop tools_logstash_1
-	docker stop tools_elasticsearch_1
-	docker rm tools_logstash_1
-	docker rm tools_elasticsearch_1
-	docker rm tools_kibana_1
 
 VERSION:
 	@echo "awx: $(VERSION)"
@@ -634,6 +628,7 @@ Dockerfile: tools/ansible/roles/dockerfile/templates/Dockerfile.j2
 ## Build awx image for deployment on Kubernetes environment.
 awx-kube-build: Dockerfile
 	DOCKER_BUILDKIT=1 docker build -f Dockerfile \
+		--ssh default=$(SSH_AUTH_SOCK) \
 		--build-arg VERSION=$(VERSION) \
 		--build-arg SETUPTOOLS_SCM_PRETEND_VERSION=$(VERSION) \
 		--build-arg HEADLESS=$(HEADLESS) \
@@ -645,6 +640,7 @@ awx-kube-buildx: Dockerfile
 	- docker buildx create --name awx-kube-buildx
 	docker buildx use awx-kube-buildx
 	- docker buildx build \
+		--ssh default=$(SSH_AUTH_SOCK) \
 		--push \
 		--build-arg VERSION=$(VERSION) \
 		--build-arg SETUPTOOLS_SCM_PRETEND_VERSION=$(VERSION) \
@@ -668,6 +664,7 @@ Dockerfile.kube-dev: tools/ansible/roles/dockerfile/templates/Dockerfile.j2
 ## Build awx_kube_devel image for development on local Kubernetes environment.
 awx-kube-dev-build: Dockerfile.kube-dev
 	DOCKER_BUILDKIT=1 docker build -f Dockerfile.kube-dev \
+		--ssh default=$(SSH_AUTH_SOCK) \
 	    --build-arg BUILDKIT_INLINE_CACHE=1 \
 	     $(DOCKER_KUBE_DEV_CACHE_FLAG) \
 	    -t $(IMAGE_KUBE_DEV) .
@@ -677,6 +674,7 @@ awx-kube-dev-buildx: Dockerfile.kube-dev
 	- docker buildx create --name awx-kube-dev-buildx
 	docker buildx use awx-kube-dev-buildx
 	- docker buildx build \
+		--ssh default=$(SSH_AUTH_SOCK) \
 		--push \
 		--build-arg BUILDKIT_INLINE_CACHE=1 \
 		$(DOCKER_KUBE_DEV_CACHE_FLAG) \
