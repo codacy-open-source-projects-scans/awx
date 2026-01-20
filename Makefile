@@ -107,6 +107,8 @@ else
 endif
 
 .PHONY: awx-link clean clean-tmp clean-venv requirements requirements_dev \
+	update_requirements upgrade_requirements update_requirements_dev \
+	docker_update_requirements docker_upgrade_requirements docker_update_requirements_dev \
 	develop refresh adduser migrate dbchange \
 	receiver test test_unit test_coverage coverage_html \
 	sdist \
@@ -195,6 +197,36 @@ requirements: requirements_awx
 requirements_dev: requirements_awx requirements_awx_dev
 
 requirements_test: requirements
+
+## Update requirements files using pip-compile (run inside container)
+update_requirements:
+	cd requirements && ./updater.sh run
+
+## Upgrade all requirements to latest versions (run inside container)
+upgrade_requirements:
+	cd requirements && ./updater.sh upgrade
+
+## Update development requirements (run inside container)
+update_requirements_dev:
+	cd requirements && ./updater.sh dev
+
+## Update requirements using docker-runner
+docker_update_requirements:
+	@echo "Running requirements updater..."
+	AWX_DOCKER_CMD='make update_requirements' $(MAKE) docker-runner
+	@echo "Requirements update complete!"
+
+## Upgrade requirements using docker-runner
+docker_upgrade_requirements:
+	@echo "Running requirements upgrader..."
+	AWX_DOCKER_CMD='make upgrade_requirements' $(MAKE) docker-runner
+	@echo "Requirements upgrade complete!"
+
+## Update dev requirements using docker-runner
+docker_update_requirements_dev:
+	@echo "Running dev requirements updater..."
+	AWX_DOCKER_CMD='make update_requirements_dev' $(MAKE) docker-runner
+	@echo "Dev requirements update complete!"
 
 ## "Install" awx package in development mode.
 develop:
@@ -578,7 +610,7 @@ docker-compose-build: Dockerfile.dev
 docker-compose-buildx: Dockerfile.dev
 	- docker buildx create --name docker-compose-buildx
 	docker buildx use docker-compose-buildx
-	- docker buildx build \
+	docker buildx build \
 		--ssh default=$(SSH_AUTH_SOCK) \
 		--push \
 		--build-arg BUILDKIT_INLINE_CACHE=1 \
@@ -638,7 +670,7 @@ awx-kube-build: Dockerfile
 awx-kube-buildx: Dockerfile
 	- docker buildx create --name awx-kube-buildx
 	docker buildx use awx-kube-buildx
-	- docker buildx build \
+	docker buildx build \
 		--ssh default=$(SSH_AUTH_SOCK) \
 		--push \
 		--build-arg VERSION=$(VERSION) \
@@ -672,7 +704,7 @@ awx-kube-dev-build: Dockerfile.kube-dev
 awx-kube-dev-buildx: Dockerfile.kube-dev
 	- docker buildx create --name awx-kube-dev-buildx
 	docker buildx use awx-kube-dev-buildx
-	- docker buildx build \
+	docker buildx build \
 		--ssh default=$(SSH_AUTH_SOCK) \
 		--push \
 		--build-arg BUILDKIT_INLINE_CACHE=1 \
