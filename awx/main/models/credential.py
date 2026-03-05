@@ -242,6 +242,29 @@ class Credential(PasswordFieldsModel, CommonModelNameNotUnique, ResourceMixin):
                 needed.append('vault_password')
         return needed
 
+    @functools.cached_property
+    def context(self):
+        """
+        Property for storing runtime context during credential resolution.
+
+        The context is a dict keyed by CredentialInputSource PK, where each value
+        is a dict of runtime fields for that input source. Example::
+
+            {
+                <input_source_pk>: {
+                    "workload_identity_token": "<jwt_token>"
+                },
+                <another_input_source_pk>: {
+                    "workload_identity_token": "<different_jwt_token>"
+                },
+            }
+
+        This structure allows each input source to have its own set of runtime
+        values, avoiding conflicts when a credential has multiple input sources
+        with different configurations (e.g., different JWT audiences).
+        """
+        return {}
+
     @cached_property
     def dynamic_input_fields(self):
         # if the credential is not yet saved we can't access the input_sources
@@ -367,7 +390,7 @@ class Credential(PasswordFieldsModel, CommonModelNameNotUnique, ResourceMixin):
     def _get_dynamic_input(self, field_name):
         for input_source in self.input_sources.all():
             if input_source.input_field_name == field_name:
-                return input_source.get_input_value()
+                return input_source.get_input_value(context=self.context)
         else:
             raise ValueError('{} is not a dynamic input field'.format(field_name))
 
@@ -622,7 +645,15 @@ class CredentialInputSource(PrimordialModel):
             raise ValidationError(_('Input field must be defined on target credential (options are {}).'.format(', '.join(sorted(defined_fields)))))
         return self.input_field_name
 
-    def get_input_value(self):
+    def get_input_value(self, context: dict | None = None):
+        """
+        Retrieve the value from the external credential backend.
+
+        Args:
+            context: Optional runtime context dict passed from the target credential.
+        """
+        if context is None:
+            context = {}
         backend = self.source_credential.credential_type.plugin.backend
         backend_kwargs = {}
         for field_name, value in self.source_credential.inputs.items():
@@ -632,6 +663,17 @@ class CredentialInputSource(PrimordialModel):
                 backend_kwargs[field_name] = value
 
         backend_kwargs.update(self.metadata)
+
+        # Resolve internal fields from the per-input-source context.
+        # The context dict is keyed by input source PK, e.g.:
+        #   {42: {"workload_identity_token": "eyJ..."}, 43: {"workload_identity_token": "eyX..."}}
+        # This allows each input source to carry its own runtime values.
+        input_source_context = context.get(self.pk, {})
+        for field in self.source_credential.credential_type.inputs.get('fields', []):
+            if field.get('internal'):
+                value = input_source_context.get(field['id'])
+                if value is not None:
+                    backend_kwargs[field['id']] = value
 
         with set_environ(**settings.AWX_TASK_ENV):
             return backend(**backend_kwargs)
