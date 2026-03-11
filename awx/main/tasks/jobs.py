@@ -94,10 +94,7 @@ from flags.state import flag_enabled
 
 # Workload Identity
 from ansible_base.lib.workload_identity.controller import AutomationControllerJobScope
-
-from ansible_base.resource_registry.workload_identity_client import (
-    get_workload_identity_client,
-)
+from ansible_base.resource_registry.workload_identity_client import get_workload_identity_client
 
 logger = logging.getLogger('awx.main.tasks.jobs')
 
@@ -161,7 +158,12 @@ def populate_claims_for_workload(unified_job) -> dict:
     return claims
 
 
-def retrieve_workload_identity_jwt(unified_job: UnifiedJob, audience: str, scope: str) -> str:
+def retrieve_workload_identity_jwt(
+    unified_job: UnifiedJob,
+    audience: str,
+    scope: str,
+    workload_ttl_seconds: int | None = None,
+) -> str:
     """Retrieve JWT token from workload claims.
     Raises:
         RuntimeError: if the workload identity client is not configured.
@@ -170,7 +172,10 @@ def retrieve_workload_identity_jwt(unified_job: UnifiedJob, audience: str, scope
     if client is None:
         raise RuntimeError("Workload identity client is not configured")
     claims = populate_claims_for_workload(unified_job)
-    return client.request_workload_jwt(claims=claims, scope=scope, audience=audience).jwt
+    kwargs = {"claims": claims, "scope": scope, "audience": audience}
+    if workload_ttl_seconds:
+        kwargs["workload_ttl_seconds"] = workload_ttl_seconds
+    return client.request_workload_jwt(**kwargs).jwt
 
 
 def with_path_cleanup(f):
@@ -243,9 +248,14 @@ class BaseTask(object):
         )
         for credential_ctx, input_src in credential_input_sources:
             if flag_enabled("FEATURE_OIDC_WORKLOAD_IDENTITY_ENABLED"):
+                effective_timeout = self.get_instance_timeout(self.instance)
+                workload_ttl = effective_timeout if effective_timeout else None
                 try:
                     jwt = retrieve_workload_identity_jwt(
-                        self.instance, audience=input_src.source_credential.get_input('jwt_aud'), scope=AutomationControllerJobScope.name
+                        self.instance,
+                        audience=input_src.source_credential.get_input('jwt_aud'),
+                        scope=AutomationControllerJobScope.name,
+                        workload_ttl_seconds=workload_ttl,
                     )
                     # Store token keyed by input source PK, since a credential can have
                     # multiple input sources (one per field), each potentially with a different audience
@@ -500,6 +510,7 @@ class BaseTask(object):
         return []
 
     def get_instance_timeout(self, instance):
+        """Return the effective job timeout in seconds."""
         global_timeout_setting_name = instance._global_timeout_setting()
         if global_timeout_setting_name:
             global_timeout = getattr(settings, global_timeout_setting_name, 0)
@@ -673,7 +684,7 @@ class BaseTask(object):
                 raise RuntimeError('AWX_ISOLATION_BASE_PATH=%s does not exist' % settings.AWX_ISOLATION_BASE_PATH)
 
             if flag_enabled("FEATURE_OIDC_WORKLOAD_IDENTITY_ENABLED"):
-                logger.info(f'Generating workload identity tokens for job {self.instance.id}')
+                logger.info(f'Generating workload identity tokens for {self.instance.log_format}')
                 self.populate_workload_identity_tokens()
                 if self.instance.status == 'error':
                     raise RuntimeError('not starting %s task' % self.instance.status)
