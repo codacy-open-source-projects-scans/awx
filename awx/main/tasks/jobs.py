@@ -254,7 +254,7 @@ class BaseTask(object):
                 try:
                     jwt = retrieve_workload_identity_jwt(
                         self.instance,
-                        audience=input_src.source_credential.get_input('jwt_aud'),
+                        audience=input_src.source_credential.get_input('url'),
                         scope=AutomationControllerJobScope.name,
                         workload_ttl_seconds=workload_ttl,
                     )
@@ -1331,6 +1331,7 @@ class RunJob(SourceControlMixin, BaseTask):
                 hosts_qs = job.get_source_hosts_for_constructed_inventory()
             else:
                 hosts_qs = job.inventory.hosts
+            hosts_qs = hosts_qs.only(*HOST_FACTS_FIELDS)
             finish_fact_cache(
                 hosts_qs,
                 artifacts_dir=os.path.join(private_data_dir, 'artifacts', str(job.id)),
